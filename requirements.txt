@@ -1,4 +1,5 @@
 PyNaCl
 aiohttp
+davey
 discord.py
 yt-dlp
