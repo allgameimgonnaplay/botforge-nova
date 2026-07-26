@@ -1,0 +1,4 @@
+PyNaCl
+aiohttp
+discord.py
+yt-dlp
