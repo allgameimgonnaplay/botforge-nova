@@ -1,0 +1,5 @@
+PyNaCl
+aiohttp
+discord.py[voice]>=2.3.0
+edge-tts
+yt-dlp
