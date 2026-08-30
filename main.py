@@ -79,12 +79,12 @@ SNAPSHOT_DIR = DATA_DIR / "snapshots"
 INCIDENT_LOG = DATA_DIR / "incident_log.jsonl"   # append-only (Part 4.2)
 SCHEMA_VERSION = 2
 
-DISCORD_TOKEN = os.getenv(os.environ["DISCORD_TOKEN"], "")
-GROQ_API_KEY = os.getenv(os.environ["GROQ_API_KEY"], "")
-GEMINI_API_KEY = os.getenv(os.environ["GEMINI_API_KEY"], "")
-OWNER_ID = int(os.getenv("v790434334372921395", "0"))
-ALERT_CHANNEL_ID = int(os.getenv("1542224708102135960", "0"))
-HOME_GUILD_ID = int(os.getenv("1516802528749158602", "0"))
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+ALERT_CHANNEL_ID = int(os.getenv("ALERT_CHANNEL_ID", "0"))
+HOME_GUILD_ID = int(os.getenv("HOME_GUILD_ID", "0"))
 OWNER_HELPLINE = os.getenv("OWNER_HELPLINE", "")  # optional, Part 8.4
 
 GROQ_MODEL = "llama-3.3-70b-versatile"
