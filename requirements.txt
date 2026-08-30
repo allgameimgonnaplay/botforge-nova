@@ -1,6 +1,5 @@
 PyNaCl
 aiohttp
-davey
-discord.py
-edge_tts
+discord.py[voice]>=2.3.0
+edge-tts
 yt-dlp
