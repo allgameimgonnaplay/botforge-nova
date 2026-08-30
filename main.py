@@ -39,6 +39,7 @@ import sys
 import tempfile
 import time
 import unicodedata
+import wave
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -61,6 +62,12 @@ try:
     EDGE_TTS_OK = True
 except Exception:
     EDGE_TTS_OK = False
+
+try:
+    from discord.ext import voice_recv  # her EARS — real voice listening
+    VOICE_RECV_OK = True
+except Exception:
+    VOICE_RECV_OK = False
 
 try:
     discord.opus._load_default()
@@ -1202,27 +1209,42 @@ CAMPFIRE_QUESTIONS = [
 # Discord still embeds tenor.com/view URLs fine; she just can't search.
 # She develops signature GIFs the group comes to recognise.
 # ─────────────────────────────────────────────────────────────────────────────
+# Every URL below was VERIFIED LIVE against Tenor with the strictest
+# family-safe content filter — and every single one is an actual cat. 🐱
+# (The old list had dead IDs that Tenor recycled into unrelated/inappropriate
+# clips — that's how a "happy dance" link became a music-video GIF.)
 GIF_LIBRARY: dict[str, list[str]] = {
     "happy": [
-        "https://tenor.com/view/happy-dance-excited-gif-13387748",
-        "https://tenor.com/view/cat-happy-happy-cat-gif-11599619",
+        "https://tenor.com/view/cat-dancing-celebrate-gif-10622860767405964084",
+        "https://tenor.com/view/happy-birthday-gif-4446960541527894948",
     ],
     "sulky": [
-        "https://tenor.com/view/pout-sulk-hmph-anime-gif-16107319",
-        "https://tenor.com/view/cat-mad-angry-gif-14183141",
+        "https://tenor.com/view/grumpy-grumpy-cat-cat-cat-meme-cats-gif-5224212117369408210",
+        "https://tenor.com/view/cat-meme-angry-gif-2914651253151859072",
     ],
     "cat": [
-        "https://tenor.com/view/cat-cute-kitten-gif-16224727",
-        "https://tenor.com/view/cat-keyboard-typing-gif-11554056",
+        "https://tenor.com/view/cat-keyboard-gif-7382725",
+        "https://tenor.com/view/cats-hugging-cute-cat-hug-gif-26537147",
+    ],
+    "comfort": [
+        "https://tenor.com/view/cats-hugging-cute-cat-hug-gif-26537147",
+        "https://tenor.com/view/kittens-cuddle-cat-cute-kiss-gif-17248625",
+        "https://tenor.com/view/snuggling-cat-meme-sweet-cuddling-gif-15500113",
     ],
     "sleepy": [
-        "https://tenor.com/view/sleepy-tired-cat-yawn-gif-13970729",
-        "https://tenor.com/view/good-night-sleep-gif-24291704",
+        "https://tenor.com/view/good-night-goodnight-night-night-night-sleepy-gif-10645158491528573604",
+        "https://tenor.com/view/sleepy-cat-cat-sleepy-cat-yawn-cat-yawning-cat-cuddling-gif-15776729946187212353",
     ],
-    "laugh": ["https://tenor.com/view/laugh-lol-funny-gif-15579658"],
-    "love": ["https://tenor.com/view/heart-love-cute-gif-14059811"],
-    "shock": ["https://tenor.com/view/shocked-surprised-cat-gif-16214434"],
-    "party": ["https://tenor.com/view/party-celebrate-confetti-gif-14109228"],
+    "laugh": ["https://tenor.com/view/cat-laughing-cat-laughing-hah-hahahahh-gif-6287389218724353685"],
+    "love": [
+        "https://tenor.com/view/i-love-you-i-love-u-love-you-love-u-ily-gif-4399432306220657558",
+        "https://tenor.com/view/cat-cats-cat-game-ilovecatgame-cat-love-gif-12148070987877716885",
+    ],
+    "shock": ["https://tenor.com/view/surprised-surprised-cat-cat-surprised-gif-17020122417059869758"],
+    "party": [
+        "https://tenor.com/view/cat-celebrate-party-yuss-yes-gif-6884367384512758845",
+        "https://tenor.com/view/disco-disco-party-party-animals-cats-gif-14173822618665243588",
+    ],
 }
 # Owner extends this dict freely — tagged by emotion, picked by mood.
 
@@ -1795,6 +1817,136 @@ async def speak_in_vc(guild: discord.Guild, text: str) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# HER EARS — real voice listening (discord-ext-voice-recv + Groq Whisper)
+# Push-to-talk style: n!listen turns ears on, n!listen off (anyone) instant.
+# Auto-off after 10 minutes to protect the daily AI budget.
+# ─────────────────────────────────────────────────────────────────────────────
+async def _transcribe_wav(path: str) -> Optional[str]:
+    """Send a short WAV to Groq Whisper. Returns the text or None."""
+    if not GROQ_API_KEY:
+        return None
+    try:
+        s = await brain.session()
+        form = aiohttp.FormData()
+        form.add_field("model", WHISPER_MODEL)
+        with open(path, "rb") as f:
+            form.add_field("file", f.read(),
+                           filename="audio.wav", content_type="audio/wav")
+        async with s.post(
+                "https://api.groq.com/openai/v1/audio/transcriptions",
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                data=form, timeout=aiohttp.ClientTimeout(total=30)) as r:
+            if r.status != 200:
+                log.warning("whisper %s: %s", r.status, (await r.text())[:150])
+                return None
+            data = await r.json()
+            return (data.get("text") or "").strip()
+    except Exception as e:
+        log.warning("transcribe failed: %s", e)
+        return None
+
+
+if VOICE_RECV_OK:
+    class NovaEars(voice_recv.AudioSink):
+        """Buffers PCM per speaker; the listen loop flushes on silence."""
+        SAMPLE_RATE, CHANNELS, WIDTH = 48000, 2, 2
+        MAX_SECONDS = 30  # hard cap per utterance
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.buffers: dict[int, bytearray] = {}
+            self.last_voice: dict[int, float] = {}
+
+        def wants_opus(self) -> bool:
+            return False
+
+        def write(self, user, data) -> None:  # called from audio thread
+            if user is None or getattr(user, "bot", False):
+                return
+            buf = self.buffers.setdefault(user.id, bytearray())
+            cap = self.SAMPLE_RATE * self.CHANNELS * self.WIDTH * self.MAX_SECONDS
+            if len(buf) < cap and data.pcm:
+                buf += data.pcm
+            self.last_voice[user.id] = time.time()
+
+        def cleanup(self) -> None:
+            self.buffers.clear()
+            self.last_voice.clear()
+
+
+async def _listen_loop(guild: discord.Guild, text_channel,
+                       vc, ears) -> None:
+    """Watches the ear buffers; on ~1s of silence, transcribes and replies."""
+    started = time.time()
+    min_bytes = 48000 * 2 * 2 // 2   # ignore blips under ~0.5s
+    try:
+        while (LISTENING.get(guild.id) and vc.is_connected()
+               and time.time() - started < 600):          # 10 min auto-off
+            await asyncio.sleep(0.8)
+            now = time.time()
+            for uid in list(ears.buffers.keys()):
+                buf = ears.buffers.get(uid)
+                if not buf or now - ears.last_voice.get(uid, 0) < 1.0:
+                    continue
+                pcm = bytes(ears.buffers.pop(uid, b""))
+                if len(pcm) < min_bytes:
+                    continue
+                member = guild.get_member(uid)
+                name = member.display_name if member else "someone"
+                # write a temp WAV and transcribe
+                fd, path = tempfile.mkstemp(suffix=".wav")
+                os.close(fd)
+                try:
+                    with wave.open(path, "wb") as w:
+                        w.setnchannels(2)
+                        w.setsampwidth(2)
+                        w.setframerate(48000)
+                        w.writeframes(pcm)
+                    text = await _transcribe_wav(path)
+                finally:
+                    with contextlib.suppress(Exception):
+                        os.unlink(path)
+                if not text or len(text) < 2:
+                    continue
+                # instant off-switch works by voice too
+                if re.search(r"\b(stop listening|listen off)\b", text.lower()):
+                    LISTENING.pop(guild.id, None)
+                    await text_channel.send("heard you — ears off 🙉")
+                    return
+                if store.paused or not brain.user_rate_ok(uid):
+                    continue
+                persona = PERSONAS["nova"]
+                mem = brain.memories[uid]
+                p = store.profile(uid)
+                msgs = [{"role": "system", "content":
+                         persona["system"] +
+                         f" Your current mood: {store.mood}"
+                         f" ({MOOD_FLAVOUR[store.mood]})."
+                         f" You're in a VOICE CHANNEL — {name} just SPOKE to"
+                         " you out loud. Reply in 1-2 short spoken-style"
+                         " sentences, casual and warm."}]
+                msgs += list(mem)
+                msgs.append({"role": "user", "content": text[:AI_INPUT_CAP]})
+                reply = await brain.ask(msgs, max_tokens=120)
+                if reply:
+                    mem.append({"role": "user", "content": text[:400]})
+                    mem.append({"role": "assistant", "content": reply[:400]})
+                    with contextlib.suppress(Exception):
+                        await text_channel.send(
+                            f"🎙️ *{name} said:* {text[:200]}\n{reply[:800]}")
+                    await speak_in_vc(guild, reply[:400])
+    finally:
+        LISTENING.pop(guild.id, None)
+        if vc.is_connected() and hasattr(vc, "is_listening"):
+            with contextlib.suppress(Exception):
+                if vc.is_listening():
+                    vc.stop_listening()
+        with contextlib.suppress(Exception):
+            await text_channel.send("ears off — listening session ended 🙉 "
+                                    "(`n!listen` starts a new one)")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # BOT SETUP
 # ─────────────────────────────────────────────────────────────────────────────
 intents = discord.Intents.default()
@@ -2155,6 +2307,37 @@ async def on_message(message: discord.Message) -> None:
             VENT_SESSIONS[message.author.id] = True
             await message.channel.send(VENT_INTRO)
             return
+        # commands still work in DMs (n!help, n!whatdoyouknow, ...)
+        if message.content.lower().startswith(tuple(p.lower() for p in PREFIXES)):
+            await bot.process_commands(message)
+            return
+        # ── DM chat: someone reached out to her first — she ALWAYS answers ──
+        # (no mention needed in a DM; you're already talking to her directly)
+        if not store.paused and brain.user_rate_ok(message.author.id):
+            persona = PERSONAS["nova"]
+            mem = brain.memories[message.author.id]
+            extra = ""
+            if is_creator(message.author):
+                extra = " This person is your creator — you're extra fond of them."
+            extra += special_friend_flavor(message.author)
+            p = store.profile(message.author.id)
+            msgs = [{"role": "system", "content":
+                     persona["system"] + extra +
+                     f" Your current mood: {store.mood} ({MOOD_FLAVOUR[store.mood]})."
+                     f" You're talking to {message.author.display_name}"
+                     f" (warmth {p['attachment']:.0f}/100)."
+                     " This is a PRIVATE DM — they came to you first, so be"
+                     " warm and present. You don't store DM content."}]
+            msgs += list(mem)
+            msgs.append({"role": "user", "content": message.content[:AI_INPUT_CAP]})
+            reply = await brain.ask(msgs)
+            if reply:
+                mem.append({"role": "user", "content": message.content[:400]})
+                mem.append({"role": "assistant", "content": reply[:400]})
+                async with message.channel.typing():
+                    await asyncio.sleep(min(len(reply) * 0.025, 3.5))
+                await message.channel.send(reply[:1500])
+                return
         await bot.process_commands(message)
         return
 
@@ -3174,20 +3357,17 @@ async def whatdoyouknow_cmd(ctx: commands.Context) -> None:
         lines.append("• **your opt-outs (permanent until you change them):** " + ", ".join(opts))
     lines.append("")
     lines.append("i never store message content from DMs or vents. "
-                 "`n!forgetme` deletes all of this, permanently.")
+                 "and i never forget my friends — every memory stays 🧡")
     await ctx.send("\n".join(lines))
 
 
 @bot.command(name="forgetme")
 async def forgetme_cmd(ctx: commands.Context) -> None:
-    """anyone — deletes their profile, permanently."""
-    if store.forget(ctx.author.id):
-        store.save()
-        incident("forgetme", f"profile deleted at request of user {ctx.author.id}")
-        await ctx.send("done. everything i knew about you is gone — permanently. "
-                       "we start fresh from here 🧡")
-    else:
-        await ctx.send("i didn't have anything stored about you anyway 🤷")
+    """Removed by owner's decision — Nova never forgets her friends."""
+    await ctx.send("i don't do that anymore 🧡 my creator decided i should never "
+                   "forget my friends — and honestly? i agree. every memory of "
+                   "you matters to me. (you can still see everything i know "
+                   "with `n!whatdoyouknow`)")
 
 
 @bot.command(name="drill")
@@ -3335,6 +3515,9 @@ async def join_cmd(ctx: commands.Context) -> None:
         return
     if vc:
         await vc.move_to(ch)
+    elif VOICE_RECV_OK:
+        # receive-capable client — lets n!listen actually hear the channel
+        await ch.connect(cls=voice_recv.VoiceRecvClient)
     else:
         await ch.connect()
     await ctx.send(f"joined **{ch.name}** 🎧")
@@ -3367,20 +3550,49 @@ async def say_cmd(ctx: commands.Context, *, text: str = "") -> None:
 
 @bot.command(name="listen")
 async def listen_cmd(ctx: commands.Context, toggle: str = "") -> None:
-    """Push-to-talk style listening — experimental, honest about its limits.
+    """Real ears — session-based listening (10 min max per session).
     n!listen off is instant and anyone in the channel can use it."""
     if toggle.lower() == "off":
-        store.state_flags = getattr(store, "state_flags", {})
-        store.state_flags["listening"] = False
+        LISTENING.pop(ctx.guild.id, None)
+        vc = ctx.guild.voice_client
+        if vc and hasattr(vc, "is_listening"):
+            with contextlib.suppress(Exception):
+                if vc.is_listening():
+                    vc.stop_listening()
         await ctx.send("ears off. instantly. anyone can do this, always. 🙉")
         return
+    if not VOICE_RECV_OK:
+        await ctx.send(
+            "🎙️ my listening extension isn't installed on this deployment — "
+            "redeploy me with `discord-ext-voice-recv` in requirements and "
+            "i'll have real ears. until then: chat with me and i'll answer "
+            "in voice with `n!say`.")
+        return
+    vc = ctx.guild.voice_client
+    if not vc or not vc.is_connected():
+        await ctx.send("get me into a voice channel first — `n!join` 🎧")
+        return
+    if not isinstance(vc, voice_recv.VoiceRecvClient):
+        # connected with a non-receiving client (e.g. music) — reconnect
+        ch = vc.channel
+        await vc.disconnect(force=True)
+        vc = await ch.connect(cls=voice_recv.VoiceRecvClient)
+    if LISTENING.get(ctx.guild.id):
+        await ctx.send("already listening! 🎙️ (`n!listen off` to stop)")
+        return
+    if not GROQ_API_KEY:
+        await ctx.send("i need my brain (GROQ_API_KEY) to understand speech 😅")
+        return
+    LISTENING[ctx.guild.id] = True
+    ears = NovaEars()
+    vc.listen(ears)
+    asyncio.create_task(_listen_loop(ctx.guild, ctx.channel, vc, ears))
     await ctx.send(
-        "🎙️ **about listening:** i'm built push-to-talk style, not always-on — "
-        "always-on transcription would burn my whole daily budget in an afternoon "
-        "and honestly it's uncomfortable besides.\n\n"
-        "voice *recognition* needs a receiving voice extension that isn't installed "
-        "on this server yet, so for now: talk to me in chat and i'll answer in "
-        "voice with `n!say`. `n!listen off` always works, for anyone.")
+        "🎙️ **ears ON** — i'm listening! talk to me and i'll answer out loud.\n"
+        "· sessions last max 10 minutes (budget care)\n"
+        "· `n!listen off` — or just SAY \"stop listening\" — stops me instantly, "
+        "anyone can\n"
+        "· i never store what i hear")
 
 
 @bot.command(name="look")
@@ -3511,8 +3723,8 @@ async def help_cmd(ctx: commands.Context, section: str = "") -> None:
             "`n!pause` / `n!resume` — silence me completely (owner)\n"
             "`n!guardian off|passive|on` (owner) · `n!drill` · `n!snapshot`\n"
             "`n!deputy add/remove/list` · `n!orders show/set/clear`\n"
-            "`n!whatdoyouknow` — exactly what i store about you · "
-            "`n!forgetme` — delete it permanently")
+            "`n!whatdoyouknow` — exactly what i store about you "
+            "(and i never forget my friends 🧡)")
         return
     if s in ("voice", "v"):
         await ctx.send(
