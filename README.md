@@ -1,9 +1,15 @@
 # Nova!
 
-Discord bot deployed with **BotForge** 🤖
+A Discord bot.
 
-- Runtime: Python (discord.py)
-- Host: Render free Web Service (keep-alive server included)
-- Secrets: `DISCORD_TOKEN` lives in Render env vars — never in this repo
+- Language: Python (discord.py)
+- Host: Render free web service
+- The `DISCORD_TOKEN` is stored as a secret environment variable on the
+  host — it is **never** committed to this repository.
 
-Keep it awake 24/7 for free: add the service URL to [UptimeRobot](https://uptimerobot.com) with a 5-minute interval.
+## Keep-alive (free 24/7)
+
+Render free services sleep after 15 minutes without traffic. A tiny HTTP
+health server is injected at the top of the main file. Point a free
+uptime monitor (UptimeRobot / cron-job.org) at the service URL with a
+5-minute interval to keep the bot awake around the clock — free forever.
