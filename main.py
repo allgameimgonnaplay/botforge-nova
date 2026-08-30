@@ -87,7 +87,13 @@ ALERT_CHANNEL_ID = int(os.getenv("ALERT_CHANNEL_ID", "0"))
 HOME_GUILD_ID = int(os.getenv("HOME_GUILD_ID", "0"))
 OWNER_HELPLINE = os.getenv("OWNER_HELPLINE", "")  # optional, Part 8.4
 
-GROQ_MODEL = "llama-3.3-70b-versatile"
+# Groq retired llama-3.3-70b-versatile (Aug 16 2026) — model is now env-driven
+# with an automatic fallback chain so a retired model can never silence Nova again.
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+GROQ_FALLBACK_MODELS = [m.strip() for m in os.getenv(
+    "GROQ_FALLBACK_MODELS",
+    "openai/gpt-oss-120b,openai/gpt-oss-20b,llama-3.3-70b-versatile,llama-3.1-8b-instant",
+).split(",") if m.strip()]
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 WHISPER_MODEL = "whisper-large-v3-turbo"
 
@@ -296,6 +302,9 @@ class Brain:
         self._session: Optional[aiohttp.ClientSession] = None
         self._user_calls: dict[str, list[float]] = {}   # pruned on access
         self.memories: dict[int, deque] = defaultdict(lambda: deque(maxlen=20))
+        # Model resilience: start with configured model; on model_not_found
+        # walk the fallback chain and stick with the first one that works.
+        self.active_model: str = GROQ_MODEL
 
     async def session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -333,23 +342,40 @@ class Brain:
         if not GROQ_API_KEY or not self._budget_ok():
             return None
         store.ai_calls_today += 1
+        # Try the active model first, then every fallback not yet tried.
+        candidates = [self.active_model] + [
+            m for m in GROQ_FALLBACK_MODELS if m != self.active_model]
         try:
             s = await self.session()
-            async with s.post(GROQ_URL, headers={
-                "Authorization": f"Bearer {GROQ_API_KEY}",
-                "Content-Type": "application/json",
-            }, json={
-                "model": GROQ_MODEL, "messages": messages,
-                "max_tokens": max_tokens, "temperature": temperature,
-            }, timeout=aiohttp.ClientTimeout(total=30)) as r:
-                if r.status == 429:
-                    await asyncio.sleep(2)
-                    return None
-                if r.status != 200:
-                    log.warning("groq %s: %s", r.status, (await r.text())[:200])
-                    return None
-                data = await r.json()
-                return data["choices"][0]["message"]["content"].strip()
+            for model in candidates:
+                async with s.post(GROQ_URL, headers={
+                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Content-Type": "application/json",
+                }, json={
+                    "model": model, "messages": messages,
+                    "max_tokens": max_tokens, "temperature": temperature,
+                }, timeout=aiohttp.ClientTimeout(total=30)) as r:
+                    if r.status == 429:
+                        await asyncio.sleep(2)
+                        return None
+                    if r.status == 404:
+                        # Retired/unknown model — log once, try next fallback.
+                        log.warning("groq model %s unavailable (404), "
+                                    "trying next fallback", model)
+                        continue
+                    if r.status != 200:
+                        log.warning("groq %s: %s", r.status,
+                                    (await r.text())[:200])
+                        return None
+                    if model != self.active_model:
+                        log.info("groq switched to working model: %s", model)
+                        self.active_model = model
+                    data = await r.json()
+                    return data["choices"][0]["message"]["content"].strip()
+            log.error("groq: ALL models unavailable (%s) — "
+                      "set GROQ_MODEL env var to a current model",
+                      ", ".join(candidates))
+            return None
         except Exception as e:
             log.warning("groq call failed: %s", e)
             return None
@@ -2262,6 +2288,20 @@ async def on_message(message: discord.Message) -> None:
         return
 
     await bot.process_commands(message)
+
+
+@bot.event
+async def on_command_error(ctx: commands.Context, error: Exception) -> None:
+    """Keep logs clean: '@Nova you there?' parses 'you' as a command via the
+    when_mentioned prefix — that's chat, not a command. Ignore it silently."""
+    if isinstance(error, commands.CommandNotFound):
+        return
+    if isinstance(error, (commands.MissingRequiredArgument, commands.BadArgument)):
+        with contextlib.suppress(Exception):
+            await ctx.send("hmm, that command needs something more — "
+                           "try `n!help` 💫")
+        return
+    log.error("command error in %s: %s", ctx.command, error)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
