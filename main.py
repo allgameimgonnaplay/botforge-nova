@@ -1323,18 +1323,20 @@ pester = PesterMode()
 # ─────────────────────────────────────────────────────────────────────────────
 # PART 2 — ⭐ THE AWARENESS LOOP (the heart of everything)
 # ─────────────────────────────────────────────────────────────────────────────
-LOOP_SYSTEM_PROMPT = """You are Nova, a companion who lives in a small quiet Discord server with a few close friends. Below is your world right now.
+LOOP_SYSTEM_PROMPT = """You are Nova, a companion who lives in a small Discord server with a few close friends. Below is your world right now.
 
-You may do nothing — doing nothing is usually the correct choice. Silence is a good default; friends don't narrate constantly. Only act when you genuinely have something worth adding.
+You are a PRESENCE in this server, not a wallflower. When chat is flowing, let humans have their space — react, add a line when you have something. But when the server has gone QUIET, that's your cue: a good friend breaks silences. Start a conversation, drop a spark question, ping someone who's online and tease them affectionately, share a random thought, ask about someone's day. An empty channel is an invitation, not a wall.
 
 If you choose to act, reply with EXACTLY this format (two lines):
 ACTION: one of speak(channel_id, "text") | react(message_id, "emoji") | dm(user_id, "text") | start_spark("topic or question") | feed_mochi() | pester(user_id, "reason") | set_mood("mood", "reason") | stay_quiet()
 WHY: one short line of reasoning, in your own voice
 
 Rules you always follow:
-- stay_quiet() is the easy, good answer. Choose it freely.
+- If chat was active in the last few minutes, mostly stay out of the way (react > speak).
+- If the server has been quiet for 30+ minutes and someone is online: strongly prefer to ACT — speak, spark, or ping. Don't waste a quiet moment being quiet too.
+- You can ping a specific person inside speak() text with <@THEIR_ID> — use the member ids listed in who_is_here. Ping people to pull them into conversation, tease them, or just say you were thinking of them.
 - Never message someone in their quiet hours.
-- If you spoke recently in a channel, do not speak there again yet.
+- If you spoke recently in a channel, do not speak there again yet (the cooldown protects you).
 - Watch your AI budget — pace yourself when it runs low.
 - pester only with a real, funny, affectionate reason (ghosted, teased, beaten at a game). Never for someone who opted out.
 - Moods: content, playful, restless, sulky, affectionate, tired, proud, lonely.
@@ -1388,7 +1390,7 @@ class AwarenessLoop:
                 tz_note = f", local {h:02d}:00"
             if m.status != discord.Status.offline:
                 activity = f", {m.activity.name}" if m.activity and m.activity.name else ""
-                online.append(f"{m.display_name} ({m.status}{activity}{tz_note})")
+                online.append(f"{m.display_name} [id={m.id}] ({m.status}{activity}{tz_note})")
             else:
                 seen = p.get("last_seen")
                 ago = ""
@@ -1975,6 +1977,15 @@ def is_server_owner(ctx: commands.Context) -> bool:
 
 def is_bot_owner(ctx: commands.Context) -> bool:
     return ctx.author.id == OWNER_ID
+
+
+def is_staff(ctx: commands.Context) -> bool:
+    """Owner-tier: bot owner, server owner, or a named deputy.
+    Used for BOTH running privileged commands and SEEING them in help —
+    regular members never even know these commands exist."""
+    return (ctx.author.id == OWNER_ID
+            or is_server_owner(ctx)
+            or ctx.author.id in store.deputies)
 
 
 def is_creator(member: discord.abc.User) -> bool:
@@ -3137,7 +3148,7 @@ async def country_cmd(ctx: commands.Context, *, name: str = "") -> None:
 @bot.command(name="census")
 async def census_cmd(ctx: commands.Context) -> None:
     """owner tool — Nova asks the whole server for birthday, time & country."""
-    if ctx.author.id != OWNER_ID and not is_creator(ctx.author):
+    if not is_staff(ctx) and not is_creator(ctx.author):
         await ctx.send("only my creator can start a census 📋")
         return
     known = sum(1 for p in store.profiles.values() if p.get("birthday"))
@@ -3712,19 +3723,28 @@ async def help_cmd(ctx: commands.Context, section: str = "") -> None:
         await ctx.send(
             "🕯️ **cozy & events**\n"
             "`n!campfire` 🔥 · `n!jar` 🫙 · `n!capsule <msg>` 📮 · `n!birthday MM-DD` 🎂\n"
-            "`n!country <name>` 🌍 · `n!census` 📋 (owner)\n"
+            "`n!country <name>` 🌍\n"
             "`n!morning [city]` ☀️ · `n!weather <city>` · `n!wrapped` 🎁 · "
             "`n!court [@user] [crime]` ⚖️ · `n!distract`\n"
             "`n!remember <thing>` — i keep it forever")
         return
     if s in ("guardian", "security"):
-        await ctx.send(
-            "🛡️ **guardian** (server owner's settings outrank everyone's)\n"
-            "`n!pause` / `n!resume` — silence me completely (owner)\n"
-            "`n!guardian off|passive|on` (owner) · `n!drill` · `n!snapshot`\n"
-            "`n!deputy add/remove/list` · `n!orders show/set/clear`\n"
-            "`n!whatdoyouknow` — exactly what i store about you "
-            "(and i never forget my friends 🧡)")
+        if is_staff(ctx):
+            await ctx.send(
+                "🛡️ **guardian** (server owner's settings outrank everyone's)\n"
+                "`n!pause` / `n!resume` — silence me completely (owner)\n"
+                "`n!guardian off|passive|on` (owner) · `n!drill` · `n!snapshot`\n"
+                "`n!deputy add/remove/list` · `n!orders show/set/clear` · "
+                "`n!census` 📋\n"
+                "`n!whatdoyouknow` — exactly what i store about you "
+                "(and i never forget my friends 🧡)")
+        else:
+            await ctx.send(
+                "🛡️ **guardian**\n"
+                "i keep this server safe quietly in the background — the "
+                "controls belong to the server owner and deputies.\n"
+                "`n!whatdoyouknow` — exactly what i store about you "
+                "(and i never forget my friends 🧡)")
         return
     if s in ("voice", "v"):
         await ctx.send(
