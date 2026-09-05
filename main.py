@@ -48,6 +48,7 @@ from typing import Any, Optional
 
 import aiohttp
 import discord
+from discord import app_commands
 from discord.ext import commands, tasks
 
 # ── optional deps (graceful degradation) ────────────────────────────────────
@@ -67,7 +68,30 @@ try:
     from discord.ext import voice_recv  # her EARS — real voice listening
     VOICE_RECV_OK = True
 except Exception:
+    # SELF-HEAL: this deployment's requirements.txt predates her ears.
+    # Install the extension right now, at boot, instead of refusing forever.
+    # Works even on old deployments that never listed discord-ext-voice-recv.
     VOICE_RECV_OK = False
+    try:
+        import subprocess as _sp
+        for _args in (
+            [sys.executable, "-m", "pip", "install", "-q",
+             "discord-ext-voice-recv"],
+            [sys.executable, "-m", "pip", "install", "-q", "--user",
+             "discord-ext-voice-recv"],
+        ):
+            try:
+                _sp.check_call(_args, timeout=180)
+                break
+            except Exception:
+                continue
+        import importlib as _il
+        import site as _site
+        _il.reload(_site)  # pick up --user site-packages if that path won
+        from discord.ext import voice_recv  # noqa: F811
+        VOICE_RECV_OK = True
+    except Exception:
+        VOICE_RECV_OK = False
 
 try:
     discord.opus._load_default()
@@ -1823,6 +1847,46 @@ async def speak_in_vc(guild: discord.Guild, text: str) -> bool:
 # Push-to-talk style: n!listen turns ears on, n!listen off (anyone) instant.
 # Auto-off after 10 minutes to protect the daily AI budget.
 # ─────────────────────────────────────────────────────────────────────────────
+async def _grow_ears() -> bool:
+    """Install discord-ext-voice-recv at runtime and hot-load it.
+    Fixes old deployments whose requirements.txt predates her ears —
+    no redeploy needed. Returns True when listening becomes available."""
+    global VOICE_RECV_OK, voice_recv
+    if VOICE_RECV_OK:
+        return True
+
+    def _pip() -> bool:
+        import subprocess as _sp
+        for args in (
+            [sys.executable, "-m", "pip", "install", "-q",
+             "discord-ext-voice-recv"],
+            [sys.executable, "-m", "pip", "install", "-q", "--user",
+             "discord-ext-voice-recv"],
+        ):
+            try:
+                _sp.check_call(args, timeout=180)
+                return True
+            except Exception:
+                continue
+        return False
+
+    try:
+        ok = await asyncio.get_running_loop().run_in_executor(None, _pip)
+        if not ok:
+            return False
+        import importlib
+        import site
+        importlib.reload(site)
+        from discord.ext import voice_recv as _vr
+        voice_recv = _vr
+        VOICE_RECV_OK = True
+        log.info("EARS GROWN at runtime — discord-ext-voice-recv installed")
+        return True
+    except Exception as e:
+        log.warning("ear growth failed: %s", e)
+        return False
+
+
 async def _transcribe_wav(path: str) -> Optional[str]:
     """Send a short WAV to Groq Whisper. Returns the text or None."""
     if not GROQ_API_KEY:
@@ -1848,32 +1912,43 @@ async def _transcribe_wav(path: str) -> Optional[str]:
         return None
 
 
-if VOICE_RECV_OK:
-    class NovaEars(voice_recv.AudioSink):
-        """Buffers PCM per speaker; the listen loop flushes on silence."""
-        SAMPLE_RATE, CHANNELS, WIDTH = 48000, 2, 2
-        MAX_SECONDS = 30  # hard cap per utterance
+_EARS_CLS = None  # built lazily so runtime-grown ears (self-heal) still work
 
-        def __init__(self) -> None:
-            super().__init__()
-            self.buffers: dict[int, bytearray] = {}
-            self.last_voice: dict[int, float] = {}
 
-        def wants_opus(self) -> bool:
-            return False
+def _make_ears():
+    """Build (once) and instantiate the AudioSink — LAZY so that ears
+    installed at runtime by _grow_ears() work without a restart."""
+    global _EARS_CLS
+    if _EARS_CLS is None:
+        class NovaEars(voice_recv.AudioSink):
+            """Buffers PCM per speaker; the listen loop flushes on silence."""
+            SAMPLE_RATE, CHANNELS, WIDTH = 48000, 2, 2
+            MAX_SECONDS = 30  # hard cap per utterance
 
-        def write(self, user, data) -> None:  # called from audio thread
-            if user is None or getattr(user, "bot", False):
-                return
-            buf = self.buffers.setdefault(user.id, bytearray())
-            cap = self.SAMPLE_RATE * self.CHANNELS * self.WIDTH * self.MAX_SECONDS
-            if len(buf) < cap and data.pcm:
-                buf += data.pcm
-            self.last_voice[user.id] = time.time()
+            def __init__(self) -> None:
+                super().__init__()
+                self.buffers: dict[int, bytearray] = {}
+                self.last_voice: dict[int, float] = {}
 
-        def cleanup(self) -> None:
-            self.buffers.clear()
-            self.last_voice.clear()
+            def wants_opus(self) -> bool:
+                return False
+
+            def write(self, user, data) -> None:  # called from audio thread
+                if user is None or getattr(user, "bot", False):
+                    return
+                buf = self.buffers.setdefault(user.id, bytearray())
+                cap = (self.SAMPLE_RATE * self.CHANNELS * self.WIDTH
+                       * self.MAX_SECONDS)
+                if len(buf) < cap and data.pcm:
+                    buf += data.pcm
+                self.last_voice[user.id] = time.time()
+
+            def cleanup(self) -> None:
+                self.buffers.clear()
+                self.last_voice.clear()
+
+        _EARS_CLS = NovaEars
+    return _EARS_CLS()
 
 
 async def _listen_loop(guild: discord.Guild, text_channel,
@@ -2002,6 +2077,13 @@ async def on_ready() -> None:
     log.info("Nova online as %s (guilds: %d)", bot.user, len(bot.guilds))
     log.info("opus=%s yt_dlp=%s edge_tts=%s gemini=%s",
              OPUS_OK, YTDLP_OK, EDGE_TTS_OK, bool(GEMINI_API_KEY))
+    # Slash commands: /whisper /chaos (everyone, ephemeral replies) and
+    # /staff /census (INVISIBLE to non-staff in the command picker).
+    try:
+        synced = await bot.tree.sync()
+        log.info("slash commands synced: %d", len(synced))
+    except Exception as e:
+        log.warning("slash sync failed: %s", e)
     if not heartbeat.is_running():
         heartbeat.start()
     if not periodic_snapshot.is_running():
@@ -3573,11 +3655,20 @@ async def listen_cmd(ctx: commands.Context, toggle: str = "") -> None:
         await ctx.send("ears off. instantly. anyone can do this, always. 🙉")
         return
     if not VOICE_RECV_OK:
-        await ctx.send(
-            "🎙️ my listening extension isn't installed on this deployment — "
-            "redeploy me with `discord-ext-voice-recv` in requirements and "
-            "i'll have real ears. until then: chat with me and i'll answer "
-            "in voice with `n!say`.")
+        # LAST-CHANCE SELF-HEAL: try installing her ears right now.
+        msg = await ctx.send("🎙️ my ears aren't installed yet — one sec, "
+                             "growing them right now... 🌱")
+        ok = await _grow_ears()
+        if ok:
+            await msg.edit(content="🎙️ ears installed! say `n!listen` "
+                                   "once more and i'm all yours. 👂✨")
+        else:
+            await msg.edit(
+                content="🎙️ couldn't install my listening extension on this "
+                        "host — redeploy me through BotForge (the new zip "
+                        "self-heals this) and i'll have real ears. until "
+                        "then: chat with me and i'll answer in voice with "
+                        "`n!say`.")
         return
     vc = ctx.guild.voice_client
     if not vc or not vc.is_connected():
@@ -3595,7 +3686,7 @@ async def listen_cmd(ctx: commands.Context, toggle: str = "") -> None:
         await ctx.send("i need my brain (GROQ_API_KEY) to understand speech 😅")
         return
     LISTENING[ctx.guild.id] = True
-    ears = NovaEars()
+    ears = _make_ears()
     vc.listen(ears)
     asyncio.create_task(_listen_loop(ctx.guild, ctx.channel, vc, ears))
     await ctx.send(
@@ -3692,6 +3783,122 @@ async def chaos_cmd(ctx: commands.Context) -> None:
     else:
         await ctx.send("👀 chaos council? that's classified. "
                        "(earn an invite. somehow. i can't say how.)")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SLASH COMMANDS — "Only you can see this message!" (ephemeral) + true
+# per-permission VISIBILITY: /staff and /census are invisible in the command
+# picker to anyone without Manage Server (Discord hides them at the UI level).
+# The owner can further restrict WHO sees each command in:
+# Server Settings → Integrations → Nova → Command Permissions (per user/role).
+# ─────────────────────────────────────────────────────────────────────────────
+def _i_is_staff(inter: discord.Interaction) -> bool:
+    """is_staff() for interactions: bot owner, server owner, or deputy."""
+    return (inter.user.id == OWNER_ID
+            or (inter.guild is not None
+                and inter.user.id == inter.guild.owner_id)
+            or inter.user.id in store.deputies)
+
+
+@bot.tree.command(name="whisper",
+                  description="Talk to Nova privately — only YOU see her reply")
+@app_commands.describe(message="What do you want to tell her?")
+async def slash_whisper(inter: discord.Interaction, message: str) -> None:
+    await inter.response.defer(ephemeral=True, thinking=True)
+    reply = None
+    with contextlib.suppress(Exception):
+        reply = await brain.ask([
+            {"role": "system", "content":
+                PERSONAS["nova"]["system"]
+                + "\nThis is a PRIVATE whisper from "
+                + inter.user.display_name
+                + " — only they can see your reply. Be warm, honest, a "
+                  "little conspiratorial. Keep it short."},
+            {"role": "user", "content": message},
+        ], max_tokens=220)
+    await inter.followup.send(
+        reply or "my brain's asleep rn 😴 try again in a moment?",
+        ephemeral=True)
+
+
+@bot.tree.command(name="chaos",
+                  description="Chaos Council — classified. Reply is for your eyes only")
+async def slash_chaos(inter: discord.Interaction) -> None:
+    key = special_friend_key(inter.user)
+    if key == "cupcake":
+        pts = CHAOS_POINTS.get(inter.user.id, 0)
+        rank = ("apprentice of anarchy" if pts < 25 else
+                "certified menace" if pts < 75 else
+                "chaos sommelier" if pts < 150 else
+                "supreme cupcake overlord 👑")
+        text = (f"🧁 **chaos council — classified ledger**\n"
+                f"agent: {inter.user.display_name}\n"
+                f"chaos points: **{pts}**\n"
+                f"rank: **{rank}**\n"
+                f"next meeting: whenever the creator least expects it 😈\n"
+                f"-# nobody else can see this. obviously. it's classified.")
+    elif key == "allgame":
+        text = ("😏 chaos council records? never heard of them. "
+                "definitely no file with your name on it. anyway BYE")
+    elif key == "yunbun":
+        text = "🌸 the only chaos near you is the good kind, i made sure 💖"
+    else:
+        text = ("👀 chaos council? that's classified. "
+                "(earn an invite. somehow. i can't say how.)")
+    await inter.response.send_message(text, ephemeral=True)
+
+
+@bot.tree.command(name="staff",
+                  description="Nova's control panel (staff only)")
+@app_commands.default_permissions(manage_guild=True)  # hidden from regulars
+async def slash_staff(inter: discord.Interaction) -> None:
+    if not _i_is_staff(inter):
+        await inter.response.send_message(
+            "this panel is staff-only 🤫 (and yes, only you can see "
+            "this message — that's the point)", ephemeral=True)
+        return
+    g = inter.guild
+    dep = ", ".join(str(d) for d in store.deputies) or "none"
+    await inter.response.send_message(
+        "🛡️ **nova staff panel** — only you can see this\n"
+        f"guardian: **{'ON' if guardian.enabled else 'off'}**  ·  "
+        f"posture: **{away_posture()}**\n"
+        f"deputies: {dep}\n"
+        f"guild: {g.name if g else 'DM'} · "
+        f"members: {g.member_count if g else '—'}\n\n"
+        "**prefix controls** (also staff-gated):\n"
+        "`n!guardian on/off` · `n!deputy add/remove @user`\n"
+        "`n!away` / `n!back` · `n!census` · `n!snapshot`\n"
+        "`n!restore` · `n!incidents`\n\n"
+        "-# tip: Server Settings → Integrations → Nova lets you grant "
+        "individual users access to /staff and /census.",
+        ephemeral=True)
+
+
+@bot.tree.command(name="census",
+                  description="Server census report (staff only)")
+@app_commands.default_permissions(manage_guild=True)  # hidden from regulars
+async def slash_census(inter: discord.Interaction) -> None:
+    if not _i_is_staff(inter):
+        await inter.response.send_message(
+            "census is staff-only 📋 (only you can see this)",
+            ephemeral=True)
+        return
+    g = inter.guild
+    if g is None:
+        await inter.response.send_message("run this in a server 🙂",
+                                          ephemeral=True)
+        return
+    online = sum(1 for m in g.members
+                 if m.status != discord.Status.offline and not m.bot)
+    bots = sum(1 for m in g.members if m.bot)
+    await inter.response.send_message(
+        f"📋 **census — {g.name}** (only you can see this)\n"
+        f"members: **{g.member_count}** · online now: **{online}** · "
+        f"bots: **{bots}**\n"
+        f"channels: **{len(g.channels)}** · roles: **{len(g.roles)}**\n"
+        f"created: {g.created_at.strftime('%Y-%m-%d')}",
+        ephemeral=True)
 
 
 @bot.command(name="help")
