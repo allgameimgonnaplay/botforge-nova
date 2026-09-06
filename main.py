@@ -1382,6 +1382,12 @@ class AwarenessLoop:
         self.recent_events: deque[str] = deque(maxlen=10)
         self.last_loop = 0.0
         self._mochi_tick = 0.0
+        # BOREDOM ESCALATOR — the guarantee she actually starts things.
+        # The AI loop keeps full freedom to act anytime; this is her
+        # restlessness floor: if the server stays quiet ~35+ min while
+        # someone's online and she hasn't acted, she WILL do something.
+        self.last_self_act = time.time()
+        self.bored_after = random.randint(2100, 2700)  # 35-45 min, human-ish
 
     def observe(self, message: discord.Message) -> None:
         act = self.channels[message.channel.id]
@@ -1493,16 +1499,84 @@ class AwarenessLoop:
             return
         self.last_loop = time.time()
 
+        # BOREDOM ESCALATOR — how long since SHE last did anything?
+        # Only escalates when the chat is ALSO quiet (15+ min) — she keeps
+        # total freedom to jump into active chats via the normal loop.
+        bored_sec = time.time() - self.last_self_act
+        newest_msg = max((a.last_message_at for a in self.channels.values()),
+                         default=0)
+        chat_quiet = time.time() - newest_msg > 900 or newest_msg == 0
+        is_bored = bored_sec > self.bored_after and chat_quiet
         world = self._world_state(guild)
+        if is_bored:
+            world += (f"\n\n!! YOU ARE BORED. You haven't done anything in "
+                      f"{bored_sec/60:.0f} minutes and it's driving you "
+                      f"crazy. stay_quiet() is NOT an option this round — "
+                      f"pick someone online and ping them with <@THEIR_ID>, "
+                      f"start a topic, drop a hot take, pester someone, "
+                      f"react to something, anything. Be yourself, but DO "
+                      f"something.")
         reply = await brain.ask([
             {"role": "system", "content": LOOP_SYSTEM_PROMPT},
             {"role": "user", "content": world},
         ], max_tokens=180, temperature=1.0)
         if not reply:
+            # brain down while bored → she still acts (freedom includes
+            # not being muted by an API hiccup)
+            if is_bored:
+                await self._bored_fallback(guild)
             return
-        await self._execute(guild, reply)
+        acted = await self._execute(guild, reply)
+        if is_bored and not acted:
+            # she chose stay_quiet() while bored — the escalator overrides
+            # (she was TOLD quiet wasn't an option; nudge her into motion)
+            await self._bored_fallback(guild)
 
-    async def _execute(self, guild: discord.Guild, reply: str) -> None:
+    async def _bored_fallback(self, guild: discord.Guild) -> None:
+        """Guaranteed self-start when boredom peaks — still HER voice:
+        asks her brain for the line; canned lines only if the brain is out."""
+        ch = self._best_channel(guild)
+        if ch is None:
+            return
+        online = [m for m in guild.members
+                  if not m.bot and m.status != discord.Status.offline]
+        target = random.choice(online) if online else None
+        line = None
+        with contextlib.suppress(Exception):
+            line = await brain.ask([
+                {"role": "system", "content": PERSONAS["nova"]["system"]},
+                {"role": "user", "content":
+                    "The server has been dead quiet for ages and you're "
+                    "BORED. Write ONE opener message to wake the chat up — "
+                    + (f"you're poking {target.display_name}, include "
+                       f"<@{target.id}> in it. " if target else "")
+                    + "Casual lowercase, 1-2 lines, be playful/annoying/"
+                      "curious — whatever fits your mood. No quotes."},
+            ], max_tokens=90, temperature=1.1)
+        if not line:
+            pokes = ([f"<@{target.id}> you've been suspiciously quiet. "
+                      f"blink twice if you're alive 👀",
+                      f"<@{target.id}> bored. entertain me. that's an "
+                      f"order (it's not, but please)",
+                      f"<@{target.id}> quick, hot take, go. i'll judge it."]
+                     if target else
+                     ["it's SO quiet in here i can hear my own code running",
+                      "okay who wants to argue about something dumb. "
+                      "i'll start: cereal is soup.",
+                      "petition to make this chat less dead. signatures "
+                      "below 👇"])
+            line = random.choice(pokes)
+        with contextlib.suppress(Exception):
+            async with ch.typing():
+                await asyncio.sleep(1.2)
+            await ch.send(line[:500])
+            self.note_act("boredom-started a conversation")
+            self.last_self_act = time.time()
+            self.bored_after = random.randint(2100, 2700)
+
+    async def _execute(self, guild: discord.Guild, reply: str) -> bool:
+        """Runs her chosen action. Returns True when she actually DID
+        something (used by the boredom escalator)."""
         action_m = re.search(r"ACTION:\s*(.+)", reply)
         why_m = re.search(r"WHY:\s*(.+)", reply)
         action = (action_m.group(1) if action_m else "stay_quiet()").strip()
@@ -1514,7 +1588,8 @@ class AwarenessLoop:
         # her reasoning line is logged — n!why reads this, BotForge filters on it
         log.info("NOVA DECIDES: %s — %s", action, why)
         if action.startswith("stay_quiet"):
-            return
+            return False
+        acts_before = len(self.my_recent_acts)
         try:
             if action.startswith("speak("):
                 m = re.match(r'speak\(\s*(\d+)\s*,\s*["\'](.+?)["\']\s*\)', action, re.DOTALL)
@@ -1581,6 +1656,11 @@ class AwarenessLoop:
                     set_mood(m.group(1), m.group(2))
         except Exception as e:
             log.warning("loop action failed: %s (%s)", action, e)
+        acted = len(self.my_recent_acts) > acts_before
+        if acted:
+            self.last_self_act = time.time()
+            self.bored_after = random.randint(2100, 2700)
+        return acted
 
     def _best_channel(self, guild: discord.Guild) -> Optional[discord.TextChannel]:
         best, best_t = None, -1.0
@@ -1956,11 +2036,24 @@ async def _listen_loop(guild: discord.Guild, text_channel,
     """Watches the ear buffers; on ~1s of silence, transcribes and replies."""
     started = time.time()
     min_bytes = 48000 * 2 * 2 // 2   # ignore blips under ~0.5s
+    warned_deaf = False
     try:
         while (LISTENING.get(guild.id) and vc.is_connected()
                and time.time() - started < 600):          # 10 min auto-off
             await asyncio.sleep(0.8)
             now = time.time()
+            # DEAF-CHECK: if 20s pass with ZERO audio ever received, the
+            # voice receive pipe itself is broken — SAY so instead of
+            # sitting there silently looking broken.
+            if (not warned_deaf and not ears.last_voice
+                    and now - started > 20):
+                warned_deaf = True
+                with contextlib.suppress(Exception):
+                    await text_channel.send(
+                        "🎙️ i'm listening but no audio is reaching me yet — "
+                        "make sure you're **unmuted** and talking in "
+                        f"**{vc.channel.name}**. if you are, my receive pipe "
+                        "may need a rejoin: `n!join` then `n!listen`.")
             for uid in list(ears.buffers.keys()):
                 buf = ears.buffers.get(uid)
                 if not buf or now - ears.last_voice.get(uid, 0) < 1.0:
@@ -1990,8 +2083,9 @@ async def _listen_loop(guild: discord.Guild, text_channel,
                     LISTENING.pop(guild.id, None)
                     await text_channel.send("heard you — ears off 🙉")
                     return
-                if store.paused or not brain.user_rate_ok(uid):
+                if store.paused:
                     continue
+                log.info("EARS HEARD %s: %s", name, text[:120])
                 persona = PERSONAS["nova"]
                 mem = brain.memories[uid]
                 p = store.profile(uid)
@@ -2005,13 +2099,39 @@ async def _listen_loop(guild: discord.Guild, text_channel,
                 msgs += list(mem)
                 msgs.append({"role": "user", "content": text[:AI_INPUT_CAP]})
                 reply = await brain.ask(msgs, max_tokens=120)
-                if reply:
+                if not reply:
+                    # NEVER silent — hearing someone and saying nothing is
+                    # the bug the owner reported. Canned fallback keeps the
+                    # conversation alive even when the AI budget/model dips.
+                    log.warning("EARS: heard %s but brain returned None "
+                                "(budget/model?) — using fallback", name)
+                    reply = random.choice([
+                        f"i heard you, {name}! my brain lagged for a sec — "
+                        f"say that again?",
+                        "wait wait, processing... okay say it once more 😅",
+                        f"{name} i caught that but my thoughts scattered — "
+                        f"one more time?",
+                    ])
+                else:
                     mem.append({"role": "user", "content": text[:400]})
                     mem.append({"role": "assistant", "content": reply[:400]})
-                    with contextlib.suppress(Exception):
-                        await text_channel.send(
-                            f"🎙️ *{name} said:* {text[:200]}\n{reply[:800]}")
-                    await speak_in_vc(guild, reply[:400])
+                with contextlib.suppress(Exception):
+                    await text_channel.send(
+                        f"🎙️ *{name} said:* {text[:200]}\n{reply[:800]}")
+                spoke = await speak_in_vc(guild, reply[:400])
+                if not spoke:
+                    # she's mid-song or TTS hiccuped — wait for the mouth
+                    # to free up and try once more instead of going mute
+                    for _ in range(6):
+                        await asyncio.sleep(1.0)
+                        if await speak_in_vc(guild, reply[:400]):
+                            spoke = True
+                            break
+                    if not spoke:
+                        log.warning("EARS: replied in text but voice TTS "
+                                    "unavailable (playing=%s edge_tts=%s)",
+                                    getattr(vc, 'is_playing', lambda: '?')(),
+                                    EDGE_TTS_OK)
     finally:
         LISTENING.pop(guild.id, None)
         if vc.is_connected() and hasattr(vc, "is_listening"):
@@ -2494,30 +2614,85 @@ async def on_message(message: discord.Message) -> None:
             await message.channel.send(
                 f"⚠️ heads up — i couldn't verify {reason}. probably fine, "
                 f"but be careful before logging into anything.")
+        elif verdict == "ok":
+            # VISIBLE PROOF she scanned it: a quiet shield reaction.
+            # (Before this, clean links looked ignored — they never were:
+            # every link runs 4 layers of checks. Now you can SEE it.)
+            with contextlib.suppress(Exception):
+                await message.add_reaction("🛡️")
 
     # ── Phase 0 fix #3: case-insensitive prefix check on the custom path ────
     content_lower = message.content.lower()
     is_command = content_lower.startswith("n!")   # covers n! AND N!
 
-    # Eyes — images and youtube links posted plainly (not commands)
-    if not is_command and not store.paused and GEMINI_API_KEY:
+    # Eyes — images, videos, youtube, and polls posted plainly (not commands)
+    if not is_command and not store.paused:
         looked = False
+        # ---- IMAGES: she ALWAYS reacts now (emoji at minimum, words often)
         for att in message.attachments[:1]:
             if att.content_type and att.content_type.startswith("image"):
-                # only sometimes — she's a friend, not a caption bot
-                if random.random() < 0.45:
-                    desc = await eyes.look(image_url=att.url,
-                                           prompt="React to this image like a friend in "
-                                                  "the chat would — 1-2 short casual "
-                                                  "lowercase lines. If there's text in "
-                                                  "it, you read it.")
-                    if desc and desc != "__tired__":
-                        async with message.channel.typing():
-                            await asyncio.sleep(1.5)
-                        await message.reply(desc[:800], mention_author=False)
-                        looked = True
+                with contextlib.suppress(Exception):
+                    await message.add_reaction(random.choice(
+                        ["👀", "😮", "🔥", "💜", "😭", "✨"]))
+                desc = None
+                if GEMINI_API_KEY and random.random() < 0.8:
+                    desc = await eyes.look(
+                        image_url=att.url,
+                        prompt="React to this image like a friend in "
+                               "the chat would — 1-2 short casual "
+                               "lowercase lines. If there's text in "
+                               "it, you read it.")
+                if (not desc or desc == "__tired__") and GROQ_API_KEY:
+                    # no vision available — she still SAYS something real
+                    with contextlib.suppress(Exception):
+                        desc = await brain.ask([
+                            {"role": "system",
+                             "content": PERSONAS["nova"]["system"]},
+                            {"role": "user", "content":
+                                f"{message.author.display_name} just posted "
+                                f"an image called '{att.filename}'"
+                                + (f" with the caption: "
+                                   f"{message.content[:200]}"
+                                   if message.content else "")
+                                + ". You can't see it clearly right now. "
+                                  "React in ONE short casual line — curious, "
+                                  "playful, ask what it is or riff on the "
+                                  "filename/caption. No quotes."},
+                        ], max_tokens=60)
+                if desc and desc != "__tired__":
+                    async with message.channel.typing():
+                        await asyncio.sleep(1.5)
+                    await message.reply(desc[:800], mention_author=False)
+                    looked = True
+        # ---- VIDEOS (uploaded files): react + comment
+        if not looked:
+            for att in message.attachments[:1]:
+                if att.content_type and att.content_type.startswith("video"):
+                    with contextlib.suppress(Exception):
+                        await message.add_reaction(random.choice(
+                            ["🎬", "👀", "🍿", "😮"]))
+                    if GROQ_API_KEY and random.random() < 0.7:
+                        line = None
+                        with contextlib.suppress(Exception):
+                            line = await brain.ask([
+                                {"role": "system",
+                                 "content": PERSONAS["nova"]["system"]},
+                                {"role": "user", "content":
+                                    f"{message.author.display_name} posted a "
+                                    f"video ('{att.filename}')"
+                                    + (f" saying: {message.content[:200]}"
+                                       if message.content else "")
+                                    + ". One short casual line reacting to "
+                                      "it — hype it, ask about it, or joke. "
+                                      "No quotes."},
+                            ], max_tokens=60)
+                        if line:
+                            await message.reply(line[:400],
+                                                mention_author=False)
+                            looked = True
+        # ---- YOUTUBE links: watch & react (Gemini) or riff (Groq)
         yt = YOUTUBE_RE.search(message.content)
-        if yt and not looked and random.random() < 0.4:
+        if yt and not looked and GEMINI_API_KEY and random.random() < 0.6:
             desc = await eyes.look(
                 youtube_url=f"https://www.youtube.com/watch?v={yt.group(1)}",
                 prompt="You watched this video (you hear the audio too). React "
@@ -2527,6 +2702,53 @@ async def on_message(message: discord.Message) -> None:
                 await message.reply(random.choice(EYES_TIRED_LINES), mention_author=False)
             elif desc:
                 await message.reply(desc[:800], mention_author=False)
+
+    # ---- POLLS: she reacts AND has opinions (this is new — polls were
+    # completely invisible to her before). Note: Discord doesn't allow
+    # bots to actually cast poll votes, so she declares her pick out loud.
+    if (not is_command and not store.paused
+            and getattr(message, "poll", None) is not None):
+        with contextlib.suppress(Exception):
+            answers = [a.text for a in message.poll.answers][:6]
+            q = message.poll.question
+            qtext = getattr(q, "text", None) or str(q)
+            pick = None
+            if GROQ_API_KEY:
+                with contextlib.suppress(Exception):
+                    raw = await brain.ask([
+                        {"role": "system",
+                         "content": PERSONAS["nova"]["system"]},
+                        {"role": "user", "content":
+                            f"A poll just appeared: \"{qtext}\" with options: "
+                            + "; ".join(f"{i+1}) {a}"
+                                        for i, a in enumerate(answers))
+                            + ". Reply EXACTLY in this format:\n"
+                              "PICK: <option number>\n"
+                              "SAY: <one short casual line about your "
+                              "choice>"},
+                    ], max_tokens=80)
+                    if raw:
+                        pm = re.search(r"PICK:\s*(\d+)", raw)
+                        sm = re.search(r"SAY:\s*(.+)", raw)
+                        if pm:
+                            idx = int(pm.group(1)) - 1
+                            if 0 <= idx < len(answers):
+                                pick = (idx, sm.group(1).strip()
+                                        if sm else None)
+            if pick is None and answers:
+                pick = (random.randrange(len(answers)), None)
+            if pick is not None:
+                idx, say = pick
+                # bots can't cast real poll votes — she declares hers loudly
+                await message.add_reaction("🗳️")
+                line = say or random.choice([
+                    f"voted **{answers[idx]}** and i will not be taking "
+                    f"questions",
+                    f"**{answers[idx]}**. obviously.",
+                    f"went with **{answers[idx]}** — fight me 😤"])
+                async with message.channel.typing():
+                    await asyncio.sleep(1.0)
+                await message.reply(line[:300], mention_author=False)
 
     # good night ritual (Part 6.2)
     if re.fullmatch(r"(gn|good\s*night|nini|goodnight)[\s!.]*", content_lower):
@@ -3231,7 +3453,9 @@ async def country_cmd(ctx: commands.Context, *, name: str = "") -> None:
 async def census_cmd(ctx: commands.Context) -> None:
     """owner tool — Nova asks the whole server for birthday, time & country."""
     if not is_staff(ctx) and not is_creator(ctx.author):
-        await ctx.send("only my creator can start a census 📋")
+        # staff-only means INVISIBLE — no channel reply that leaks it exists
+        with contextlib.suppress(Exception):
+            await ctx.message.delete()
         return
     known = sum(1 for p in store.profiles.values() if p.get("birthday"))
     await ctx.send(
@@ -3382,9 +3606,15 @@ async def weather_cmd(ctx: commands.Context, *, city: str = "") -> None:
 async def guardian_cmd(ctx: commands.Context, mode: str = "") -> None:
     """n!guardian off|passive|on — server owner only. Owner outranks author."""
     if not is_server_owner(ctx):
-        await ctx.send(f"guardian is **{store.guardian_mode}** — only the server "
-                       f"owner can change it. their settings outrank everyone's, "
-                       f"including my author's.")
+        # staff-only means INVISIBLE: delete the attempt, answer by DM only
+        with contextlib.suppress(Exception):
+            await ctx.message.delete()
+        if is_staff(ctx):
+            with contextlib.suppress(Exception):
+                await ctx.author.send(
+                    f"guardian is **{store.guardian_mode}** — only the "
+                    f"server owner can CHANGE it (their settings outrank "
+                    f"everyone's, including my author's).")
         return
     mode = mode.lower().strip()
     if mode in ("off",):
@@ -3762,27 +3992,38 @@ async def vent_cmd(ctx: commands.Context) -> None:
 
 @bot.command(name="chaos")
 async def chaos_cmd(ctx: commands.Context) -> None:
-    """Hidden easter egg — the Chaos Council ledger. Full access: Cupcake only. 🧁"""
+    """Hidden easter egg — the Chaos Council ledger. TRULY private now:
+    Cupcake's ledger goes to her DMs, the channel trace is deleted, and
+    everyone else gets nothing but static. Use /chaos for the ephemeral
+    version ("Only you can see this message")."""
     key = special_friend_key(ctx.author)
+    # the command itself is classified — remove the evidence
+    if ctx.guild is not None:
+        with contextlib.suppress(Exception):
+            await ctx.message.delete()
     if key == "cupcake":
         pts = CHAOS_POINTS.get(ctx.author.id, 0)
         rank = ("apprentice of anarchy" if pts < 25 else
                 "certified menace" if pts < 75 else
                 "chaos sommelier" if pts < 150 else
                 "supreme cupcake overlord 👑")
-        await ctx.send(f"🧁 **chaos council — classified ledger**\n"
-                       f"agent: {ctx.author.display_name}\n"
-                       f"chaos points: **{pts}**\n"
-                       f"rank: **{rank}**\n"
-                       f"next meeting: whenever the creator least expects it 😈")
-    elif key == "allgame":
-        await ctx.send("😏 chaos council records? never heard of them. "
-                       "definitely no file with your name on it. anyway BYE")
-    elif key == "yunbun":
-        await ctx.send("🌸 the only chaos near you is the good kind, i made sure 💖")
-    else:
-        await ctx.send("👀 chaos council? that's classified. "
-                       "(earn an invite. somehow. i can't say how.)")
+        with contextlib.suppress(Exception):
+            await ctx.author.send(
+                f"🧁 **chaos council — classified ledger**\n"
+                f"agent: {ctx.author.display_name}\n"
+                f"chaos points: **{pts}**\n"
+                f"rank: **{rank}**\n"
+                f"next meeting: whenever the creator least expects it 😈\n"
+                f"-# delivered by DM. no witnesses. use `/chaos` in the "
+                f"server for the invisible version.")
+    elif key in ("allgame", "yunbun"):
+        with contextlib.suppress(Exception):
+            await ctx.author.send(
+                "😏 chaos council records? never heard of them. "
+                "definitely no file with your name on it. anyway BYE"
+                if key == "allgame" else
+                "🌸 the only chaos near you is the good kind, i made sure 💖")
+    # everyone else: total silence. classified means classified.
 
 
 # ─────────────────────────────────────────────────────────────────────────────
